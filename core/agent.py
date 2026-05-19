@@ -27,6 +27,10 @@ class Agent:
         self.reflector = Reflector(llm)
         self.llm = llm
         self.memory = AgentMemory(llm=llm)
+        self.state: dict = {
+            "evidence": [],   # 结构化事实证据列表，跨步骤持久
+            "searches_done": set(),  # 已执行的搜索查询
+        }
         self.max_reflection_rounds = max_reflection_rounds
         self.max_total_steps = max_total_steps      # 防止无限循环的安全阀
         self._written_files: set[str] = set()       # 追踪写入的文件路径，用于最终回写
@@ -36,6 +40,25 @@ class Agent:
         """Callback for streaming LLM output — prints tokens in real-time."""
         print(chunk, end="", flush=True)
 
+    def _format_evidence(self) -> str:
+        """Format accumulated evidence for injection into Executor context."""
+        if not self.state["evidence"]:
+            return ""
+        lines = ["=== Already Known Facts ==="]
+        for e in self.state["evidence"]:
+            lines.append(f"- {e}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_evidence(result: str) -> list[str]:
+        """Extract [EVIDENCE] lines from LLM reasoning output."""
+        lines = re.findall(r'^\[EVIDENCE\]\s*(.+)$', result, re.MULTILINE)
+        return [line.strip() for line in lines if line.strip()]
+
+    @staticmethod
+    def _strip_evidence(result: str) -> str:
+        """Remove [EVIDENCE] lines from result for clean memory storage."""
+        return re.sub(r'^\[EVIDENCE\].*$\n?', '', result, flags=re.MULTILINE).rstrip()
 
     def run(self, task: str) -> dict:
         """Run the full agent loop: plan → execute → reflect → repeat if needed."""
@@ -74,10 +97,16 @@ class Agent:
                 if is_reasoning:
                     print(f"[Executor] Reasoning: ", end="", flush=True)
 
+                # 注入当前已积累的结构化证据到 context
+                evidence_block = self._format_evidence()
+                context_with_state = self.memory.get_context()
+                if evidence_block:
+                    context_with_state += "\n\n" + evidence_block
+
                 result = self.executor.execute_step(
                     step=step,
                     prev_result=prev_result,
-                    context=self.memory.get_context(),
+                    context=context_with_state,
                     task_summary=task_summary,
                     on_token=self._stream_handler if is_reasoning else None,
                 )
@@ -91,13 +120,30 @@ class Agent:
                     if path and "Successfully wrote" in result:
                         self._written_files.add(path)
 
+                # 从 LLM 推理步骤结果中提取结构化证据
+                if is_reasoning:
+                    new_ev = self._parse_evidence(result)
+                    if new_ev:
+                        for ev in new_ev:
+                            if ev not in self.state["evidence"]:
+                                self.state["evidence"].append(ev)
+                        print(f"  [State] +{len(new_ev)} evidence(s), total {len(self.state['evidence'])}\n")
+
+                # 追踪搜索查询（避免后续重复搜索）
+                if step.get("tool") == "web_search":
+                    query = step.get("tool_args", {}).get("query", "")
+                    if query:
+                        self.state["searches_done"].add(query.strip().lower())
+
                 print(f"[Executor] Step {step['step_id']} result ({len(result)} chars):")
                 print(f"  {result[:300]}{'...' if len(result) > 300 else ''}\n")
 
+                # 存储到 memory（去掉 [EVIDENCE] 行以保持干净）
+                clean_result = self._strip_evidence(result) if is_reasoning else result
                 self.memory.add(
                     step_id=step["step_id"],
                     action=step["action"],
-                    result=result,
+                    result=clean_result,
                     tool=step.get("tool"),
                 )
                 prev_result = result
@@ -146,8 +192,13 @@ class Agent:
 
                 print(f"[Reflector] Generating {len(missing)} additional steps...\n")
 
-                # 将缺失步骤重新交给 Planner 分配工具，确保反思轮也能调工具
-                reflection_task = "继续完成任务。已完成步骤: " + task_summary + "。需要补充: " + "; ".join(missing)
+                # 将结构化证据传给 Planner，避免重复规划已查过的内容
+                evidence_str = ""
+                if self.state["evidence"]:
+                    evidence_str = "。已掌握信息: " + "; ".join(self.state["evidence"])
+                reflection_task = ("继续完成任务。已完成步骤: " + task_summary
+                                   + "。需要补充: " + "; ".join(missing)
+                                   + evidence_str)
                 reflection_plan = self.planner.plan(reflection_task)
                 new_steps = reflection_plan.get("steps", [])
                 current_steps = []
