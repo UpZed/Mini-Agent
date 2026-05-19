@@ -16,7 +16,8 @@ Rules:
 2. If complete, respond ONLY with: {{"complete": true, "reason": "explain why it's complete"}}
 3. If NOT complete, respond ONLY with: {{"complete": false, "reason": "what's missing", "missing_steps": ["step1", "step2"]}}
 4. ⚠️ IMPORTANT — If the execution log contains [SEARCH_FAILED] markers, it means the search engine returned no useful results for those queries. Do NOT generate missing_steps that repeat the same failed searches. Instead, check if the task can be completed with what's already available, or consider if the task needs a fundamentally different search strategy.
-5. JSON only — no explanation, no markdown fences."""
+5. ⚠️ CITATION CHECK — If the execution results make factual claims (names, numbers, stars, features) but do NOT cite source URLs in the format `(source: URL)`, flag this as incomplete with reason "claims missing source citations".
+6. JSON only — no explanation, no markdown fences."""
 
 
 class Reflector:

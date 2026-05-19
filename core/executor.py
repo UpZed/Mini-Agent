@@ -20,7 +20,8 @@ RULES (strict):
 1. This is an analysis/reasoning step (no tool assigned). Do your best with the information above.
 2. If the context contains article URLs and you need more detail to complete the step, list the URLs that need to be read so the next step can fetch them.
 3. ⚠️ CRITICAL — ANTI-FABRICATION: If information is missing or insufficient, say "未找到可靠信息" honestly. Do NOT make up data.
-4. Output ONLY your analysis text, no special prefixes."""
+4. ⚠️ CITATION REQUIRED — When you reference any specific data, number, or factual claim that came from a search result or webpage, append the source URL in parentheses after the claim. Format: `AutoGen 有 40k+ GitHub stars (source: https://github.com/microsoft/autogen)`. If you cannot determine the source for a claim, do NOT make that claim.
+5. Output ONLY your analysis text, no special prefixes."""
 
 TRANSLATE_PROMPT = """You are a search query translator. Translate the following Chinese search query to English.
 
