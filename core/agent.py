@@ -1,6 +1,7 @@
 """Main Agent Loop — orchestrates the full task → plan → execute → reflect → result flow."""
 
 import re
+from datetime import datetime
 from core.llm import LLMClient
 from core.planner import Planner
 from core.executor import Executor
@@ -10,6 +11,7 @@ from core.memory import AgentMemory
 from tools.file_tools import ReadFileTool, WriteFileTool
 from tools.web_tools import WebSearchTool
 from tools.web_reader import ReadWebpageTool
+from workflow import WorkflowRegistry, Workflow
 
 
 class Agent:
@@ -27,13 +29,17 @@ class Agent:
         self.reflector = Reflector(llm)
         self.llm = llm
         self.memory = AgentMemory(llm=llm)
+        self.workflow_registry = WorkflowRegistry()
+        self.workflow: Workflow = None
         self.state: dict = {
-            "evidence": [],   # 结构化事实证据列表，跨步骤持久
-            "searches_done": set(),  # 已执行的搜索查询
+            "evidence": [],       # 结构化证据列表: [{id, fact, source_url, source_tool, step_id}, ...]
+            "searches_done": set(),
+            "evidence_counter": 0,
         }
         self.max_reflection_rounds = max_reflection_rounds
-        self.max_total_steps = max_total_steps      # 防止无限循环的安全阀
-        self._written_files: set[str] = set()       # 追踪写入的文件路径，用于最终回写
+        self.max_total_steps = max_total_steps
+        self._written_files: set[str] = set()
+        self._task_name: str = ""  # 用于报告文件名
 
     @staticmethod
     def _stream_handler(chunk: str):
@@ -44,21 +50,103 @@ class Agent:
         """Format accumulated evidence for injection into Executor context."""
         if not self.state["evidence"]:
             return ""
-        lines = ["=== Already Known Facts ==="]
+        lines = ["=== 已掌握事实（带来源引用） ==="]
         for e in self.state["evidence"]:
-            lines.append(f"- {e}")
+            src = f" (source: {e['source_url']})" if e.get("source_url") else ""
+            lines.append(f"- [{e['id']}] {e['fact']}{src}")
         return "\n".join(lines)
 
-    @staticmethod
-    def _parse_evidence(result: str) -> list[str]:
-        """Extract [EVIDENCE] lines from LLM reasoning output."""
+    def _parse_evidence(self, result: str, step_id: int) -> list[dict]:
+        """Extract structured evidence from [EVIDENCE] lines in LLM output.
+
+        Expected format: [EVIDENCE] fact statement (source: URL)
+        Returns list of dicts with id, fact, source_url.
+        """
         lines = re.findall(r'^\[EVIDENCE\]\s*(.+)$', result, re.MULTILINE)
-        return [line.strip() for line in lines if line.strip()]
+        parsed = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Extract URL from (source: URL) suffix
+            url_match = re.search(r'\(source:\s*(https?://[^\s\)]+)\)', line)
+            source_url = url_match.group(1) if url_match else ""
+            # Remove the (source: URL) part to get the fact
+            fact = re.sub(r'\s*\(source:\s*https?://[^\s\)]+\)', '', line).strip()
+
+            self.state["evidence_counter"] += 1
+            ev_id = f"ev_{self.state['evidence_counter']:03d}"
+
+            # Dedup: skip if same fact already exists
+            if any(e["fact"] == fact for e in self.state["evidence"]):
+                continue
+
+            entry = {
+                "id": ev_id,
+                "fact": fact,
+                "source_url": source_url,
+                "source_tool": "reasoning",
+                "step_id": step_id,
+            }
+            parsed.append(entry)
+            self.state["evidence"].append(entry)
+
+        return parsed
 
     @staticmethod
     def _strip_evidence(result: str) -> str:
         """Remove [EVIDENCE] lines from result for clean memory storage."""
         return re.sub(r'^\[EVIDENCE\].*$\n?', '', result, flags=re.MULTILINE).rstrip()
+
+    def _generate_report(self, task_summary: str, all_step_results: list) -> str:
+        """Generate a structured Markdown report using accumulated evidence."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = [
+            f"# 调研报告：{task_summary}",
+            f"生成时间：{now}",
+            "",
+        ]
+
+        # Summary
+        ev_count = len(self.state["evidence"])
+        src_count = len(set(e["source_url"] for e in self.state["evidence"] if e.get("source_url")))
+        lines += [
+            "## 摘要",
+            f"- 执行步骤：{len(all_step_results)} 步",
+            f"- 发现证据：{ev_count} 条",
+            f"- 引用来源：{src_count} 个",
+            "",
+        ]
+
+        # Key findings (from evidence)
+        if self.state["evidence"]:
+            lines += ["## 核心发现\n"]
+            for ev in self.state["evidence"]:
+                src = f" [来源]({ev['source_url']})" if ev.get("source_url") else ""
+                lines.append(f"- **{ev['fact']}**{src}")
+            lines.append("")
+
+        # Full execution log
+        lines += ["## 执行过程\n"]
+        for sr in all_step_results:
+            step = sr["step"]
+            result = sr["result"]
+            lines.append(f"### Step {step['step_id']}: {step['action']}")
+            lines.append(result)
+            lines.append("")
+
+        # Sources appendix
+        urls = []
+        for ev in self.state["evidence"]:
+            if ev.get("source_url") and ev["source_url"] not in urls:
+                urls.append(ev["source_url"])
+        if urls:
+            lines += ["## 参考来源\n"]
+            for i, url in enumerate(urls, 1):
+                lines.append(f"{i}. {url}")
+            lines.append("")
+
+        return "\n".join(lines)
 
     def run(self, task: str) -> dict:
         """Run the full agent loop: plan → execute → reflect → repeat if needed."""
@@ -66,8 +154,16 @@ class Agent:
         print(f"[Agent] Received task: {task}")
         print(f"{'='*60}\n")
 
-        # Phase 1: Plan
-        plan = self.planner.plan(task)
+        # Phase 0: Workflow matching
+        self.workflow = self.workflow_registry.match(task)
+        self._task_name = re.sub(r'[^\w一-鿿]', '_', task.strip())[:40]
+        print(f"[Workflow] Matched: \033[36m{self.workflow.name}\033[0m — {self.workflow.description}\n")
+
+        # Phase 1: Plan (with workflow context)
+        plan_task = task
+        if self.workflow.plan_instructions:
+            plan_task = self.workflow.plan_instructions + "\n\n原始任务：" + task
+        plan = self.planner.plan(plan_task)
         task_summary = plan.get("task_summary", task)
         steps = plan.get("steps", [])
         print(f"[Planner] Task summary: {task_summary}")
@@ -122,12 +218,13 @@ class Agent:
 
                 # 从 LLM 推理步骤结果中提取结构化证据
                 if is_reasoning:
-                    new_ev = self._parse_evidence(result)
+                    new_ev = self._parse_evidence(result, step["step_id"])
                     if new_ev:
                         for ev in new_ev:
-                            if ev not in self.state["evidence"]:
-                                self.state["evidence"].append(ev)
-                        print(f"  [State] +{len(new_ev)} evidence(s), total {len(self.state['evidence'])}\n")
+                            print(f"  [State] +{ev['id']}: {ev['fact'][:60]}...")
+                            if ev.get("source_url"):
+                                print(f"          source: {ev['source_url']}")
+                        print(f"  [State] Total evidence: {len(self.state['evidence'])}\n")
 
                 # 追踪搜索查询（避免后续重复搜索）
                 if step.get("tool") == "web_search":
@@ -168,10 +265,13 @@ class Agent:
                 break
 
             execution_log = self.memory.full_log
+            reflect_task = task_summary
+            if self.workflow.reflect_checks:
+                reflect_task = self.workflow.reflect_checks + "\n\n原始任务：" + task_summary
 
             print(f"{'─'*40}")
             print(f"[Reflector] Checking task completeness...")
-            reflection = self.reflector.reflect(task_summary, execution_log)
+            reflection = self.reflector.reflect(reflect_task, execution_log)
 
             if reflection.get("complete"):
                 print(f"[Reflector] Task is complete: {reflection.get('reason', '')}\n")
@@ -195,7 +295,8 @@ class Agent:
                 # 将结构化证据传给 Planner，避免重复规划已查过的内容
                 evidence_str = ""
                 if self.state["evidence"]:
-                    evidence_str = "。已掌握信息: " + "; ".join(self.state["evidence"])
+                    facts = [e["fact"] for e in self.state["evidence"]]
+                    evidence_str = "。已掌握信息: " + "; ".join(facts)
                 reflection_task = ("继续完成任务。已完成步骤: " + task_summary
                                    + "。需要补充: " + "; ".join(missing)
                                    + evidence_str)
@@ -229,13 +330,15 @@ class Agent:
                             "tool_args": tool_args,
                         })
 
-        # Phase 4: Compile final result
+        # Phase 4: Compile final result with structured report
+        report = self._generate_report(task_summary, all_step_results)
         final_result = self._compile_result(task_summary, all_steps, all_step_results, reflection_round)
+        final_result["report"] = report
 
         # 最终回写：如果有中途写入的文件，用完整结果覆盖
         for file_path in self._written_files:
             try:
-                self.tool_registry.run_tool("write_file", path=file_path, content=final_result["log"])
+                self.tool_registry.run_tool("write_file", path=file_path, content=report)
                 print(f"  [Agent] Final result re-written to {file_path}")
             except Exception:
                 pass

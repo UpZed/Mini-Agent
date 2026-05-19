@@ -40,9 +40,10 @@ def run_task(task: str, output_path: str = "output/result.md"):
     agent = Agent(llm)
     result = agent.run(task)
 
-    # Save result
     import os
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    # Save full execution log
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"# Agent Execution Result\n\n")
         f.write(f"**Task:** {result['task']}\n\n")
@@ -50,8 +51,14 @@ def run_task(task: str, output_path: str = "output/result.md"):
         f.write("---\n\n")
         f.write(result["log"])
 
-    print(f"\n{'='*60}")
-    print(f"[Done] Result saved to {output_path}")
+    # Save structured report if available
+    if result.get("report"):
+        report_path = output_path.replace(".md", "_report.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(result["report"])
+        print(f"[Done] Structured report saved to {report_path}")
+
+    print(f"[Done] Execution log saved to {output_path}")
     print(f"{'='*60}")
     _beep()
     return result
